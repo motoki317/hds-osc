@@ -28,6 +28,7 @@ var (
 )
 
 func main() {
+	slog.Info("hds-osc", "version", GetFormattedVersion())
 	flag.Parse()
 
 	var exporters []exporter

@@ -19,8 +19,42 @@ type receiver interface {
 	Start()
 }
 
+// Example values:
+// heartRate:80
+// stepCount:80
+// distanceTraveled:60.89095629064832
+// speed:0.8606014661155669
+// calories:7
+type healthData struct {
+	Time             time.Time `json:"time"`
+	HeartRate        int       `json:"heartRate"`
+	StepCount        int       `json:"stepCount"`
+	DistanceTraveled float64   `json:"distanceTraveled"`
+	Speed            float64   `json:"speed"`
+	Calories         int       `json:"calories"`
+}
+
+func (d *healthData) Update(key string, value float64) {
+	d.Time = time.Now()
+	switch key {
+	case "heartRate":
+		d.HeartRate = int(value)
+	case "stepCount":
+		d.StepCount = int(value)
+	case "distanceTraveled":
+		d.DistanceTraveled = value
+	case "speed":
+		d.Speed = value
+	case "calories":
+		d.Calories = int(value)
+	default:
+		slog.Warn("Unknown key", "key", key)
+	}
+}
+
 type hdsReceiver struct {
 	exporters []exporter
+	data      healthData
 }
 
 func newHDSReceiver(exporters []exporter) *hdsReceiver {
@@ -44,8 +78,6 @@ type hdsRequest struct {
 	Data string `json:"data"`
 }
 
-const hdsDataPrefix = "heartRate:"
-
 func (h *hdsReceiver) dataHandler(w http.ResponseWriter, r *http.Request) {
 	var data hdsRequest
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
@@ -54,24 +86,26 @@ func (h *hdsReceiver) dataHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("Received req", "data", data.Data)
-	if !strings.HasPrefix(data.Data, hdsDataPrefix) {
+	slog.Info("Received hds req", "data", data.Data)
+	parts := strings.Split(data.Data, ":")
+	if len(parts) != 2 {
 		slog.Error("Invalid data format", "data", data.Data)
 		http.Error(w, "Invalid data format", http.StatusBadRequest)
 		return
 	}
-	rateStr := strings.TrimPrefix(data.Data, hdsDataPrefix)
-	rate, err := strconv.Atoi(rateStr)
+	key, valueStr := parts[0], parts[1]
+	value, err := strconv.ParseFloat(valueStr, 64)
 	if err != nil {
-		slog.Error("Error parsing heartRate", "data", data.Data)
-		http.Error(w, "Invalid data format", http.StatusBadRequest)
+		slog.Error("Error parsing value", "value", valueStr)
+		http.Error(w, "Invalid value format", http.StatusBadRequest)
 		return
 	}
+	h.data.Update(key, value)
 
 	w.WriteHeader(http.StatusOK)
 
 	for _, s := range h.exporters {
-		if err = s.Send(rate); err != nil {
+		if err = s.Update(h.data, key); err != nil {
 			slog.Error("Sending data", "err", err)
 		}
 	}
@@ -113,14 +147,14 @@ func (h *wsPullReceiver) connect() error {
 			return fmt.Errorf("reading websocket: %v", err)
 		}
 
-		var msg httpSenderMessage
+		var msg wsUpdateMessage
 		if err = json.NewDecoder(bytes.NewReader(rawMsg)).Decode(&msg); err != nil {
 			return fmt.Errorf("decoding websocket message: %v", err)
 		}
-		slog.Info("Received msg", "msg", msg)
+		slog.Info("Received msg", "updatedKey", msg.UpdatedKey, "data", msg.Data)
 
 		for _, s := range h.exporters {
-			if err = s.Send(msg.HeartRate); err != nil {
+			if err = s.Update(msg.Data, msg.UpdatedKey); err != nil {
 				slog.Error("Sending data", "err", err)
 			}
 		}

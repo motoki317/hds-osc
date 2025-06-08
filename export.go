@@ -20,7 +20,7 @@ import (
 )
 
 type exporter interface {
-	Send(heartRate int) error
+	Update(data healthData, updatedKey string) error
 }
 
 type nonBlockingExporter struct {
@@ -30,11 +30,10 @@ type nonBlockingExporter struct {
 type httpServerExporter struct {
 	upgrader websocket.Upgrader
 
-	clients     []chan *httpSenderMessage
+	clients     []chan *wsUpdateMessage
 	clientsLock sync.Mutex
 
-	heartRate    int
-	receivedTime time.Time
+	data healthData
 }
 
 func newHTTPServerExporter(port int) *httpServerExporter {
@@ -57,25 +56,13 @@ func newHTTPServerExporter(port int) *httpServerExporter {
 	return h
 }
 
-type httpSenderMessage struct {
-	HeartRate int    `json:"heartRate"`
-	Time      string `json:"time"`
-}
-
-func (h *httpServerExporter) Send(rate int) error {
-	// Update latest data
-	h.heartRate = rate
-	h.receivedTime = time.Now()
-
+func (h *httpServerExporter) Update(data healthData, updatedKey string) error {
 	// Send msg to all connected clients
+	msg := wsUpdateMessage{Data: data, UpdatedKey: updatedKey}
 	h.clientsLock.Lock()
-	msg := &httpSenderMessage{
-		HeartRate: h.heartRate,
-		Time:      h.receivedTime.Format(time.RFC3339),
-	}
 	for _, ch := range h.clients {
 		select {
-		case ch <- msg:
+		case ch <- &msg:
 		default:
 		}
 	}
@@ -84,27 +71,23 @@ func (h *httpServerExporter) Send(rate int) error {
 }
 
 func (h *httpServerExporter) getLatest(w http.ResponseWriter, _ *http.Request) {
-	type latest struct {
-		HeartRate int    `json:"heartRate"`
-		Time      string `json:"time"`
-	}
-
-	if h.receivedTime.IsZero() {
+	if h.data.Time.IsZero() {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	l := latest{
-		HeartRate: h.heartRate,
-		Time:      h.receivedTime.Format(time.RFC3339),
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(l); err != nil {
+	if err := json.NewEncoder(w).Encode(h.data); err != nil {
 		slog.Error("Serving GET /latest", "err", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+}
+
+type wsUpdateMessage struct {
+	Data       healthData `json:"data"`
+	UpdatedKey string     `json:"updatedKey"`
 }
 
 func (h *httpServerExporter) connectWS(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +100,7 @@ func (h *httpServerExporter) connectWS(w http.ResponseWriter, r *http.Request) {
 
 	remoteAddr := conn.RemoteAddr()
 
-	ch := make(chan *httpSenderMessage)
+	ch := make(chan *wsUpdateMessage)
 	h.clientsLock.Lock()
 	h.clients = append(h.clients, ch)
 	slog.Info("New WebSocket connection", "addr", remoteAddr, "current", len(h.clients))
@@ -145,12 +128,10 @@ func (h *httpServerExporter) connectWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Send first data (if any)
-	if !h.receivedTime.IsZero() {
-		msg := &httpSenderMessage{
-			HeartRate: h.heartRate,
-			Time:      h.receivedTime.Format(time.RFC3339),
-		}
-		if err = conn.WriteJSON(msg); err != nil {
+	data := h.data // copy
+	if !data.Time.IsZero() {
+		msg := wsUpdateMessage{Data: data, UpdatedKey: "all"}
+		if err = conn.WriteJSON(&msg); err != nil {
 			slog.Error("Writing message", "err", err)
 			return
 		}
@@ -172,7 +153,7 @@ func (h *httpServerExporter) connectWS(w http.ResponseWriter, r *http.Request) {
 
 type oscExporter struct {
 	client       *osc.Client
-	heartRateMax float32
+	heartRateMax float64
 	addrName     string
 }
 
@@ -186,38 +167,88 @@ func newOSCExporter(sendIP string, sendPort int, addrName string) *oscExporter {
 	}
 }
 
-func (o *oscExporter) Send(rate int) error {
+func (o *oscExporter) Update(data healthData, updatedKey string) error {
+	if updatedKey != "heartRate" && updatedKey != "all" {
+		return nil
+	}
 	msg := osc.NewMessage(o.addrName)
-	floatRate := float32(rate) / o.heartRateMax
+	floatRate := float64(data.HeartRate) / o.heartRateMax
 	msg.Append(floatRate)
 	return o.client.Send(msg)
 }
 
 type prometheusExporter struct {
-	rateGauge prometheus.Gauge
-	registry  *prometheus.Registry
+	registry *prometheus.Registry
 
-	lastReceived     time.Time
-	lastReceivedLock sync.RWMutex
+	data     healthData
+	dataLock sync.RWMutex
+
+	heartRate        prometheus.GaugeFunc
+	stepCount        prometheus.CounterFunc
+	distanceTraveled prometheus.CounterFunc
+	speed            prometheus.GaugeFunc
+	calories         prometheus.CounterFunc
 }
 
 func newPrometheusExporter(port int) *prometheusExporter {
-	rateGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+	e := &prometheusExporter{}
+	// Create a custom registry without default collectors
+	e.registry = prometheus.NewRegistry()
+
+	e.heartRate = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "heart_rate",
 		Help: "Current heart rate in beats per minute",
+	}, func() float64 {
+		e.dataLock.RLock()
+		defer e.dataLock.RUnlock()
+		return float64(e.data.HeartRate)
 	})
-	// Create a custom registry without default collectors
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(rateGauge)
-	exporter := &prometheusExporter{
-		rateGauge: rateGauge,
-		registry:  registry,
-	}
+	e.registry.MustRegister(e.heartRate)
+
+	e.stepCount = prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "step_count",
+		Help: "Current step count",
+	}, func() float64 {
+		e.dataLock.RLock()
+		defer e.dataLock.RUnlock()
+		return float64(e.data.StepCount)
+	})
+	e.registry.MustRegister(e.stepCount)
+
+	e.distanceTraveled = prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "distance_traveled",
+		Help: "Current distance traveled in meters",
+	}, func() float64 {
+		e.dataLock.RLock()
+		defer e.dataLock.RUnlock()
+		return e.data.DistanceTraveled
+	})
+	e.registry.MustRegister(e.distanceTraveled)
+
+	e.speed = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "speed",
+		Help: "Current speed in meters per second",
+	}, func() float64 {
+		e.dataLock.RLock()
+		defer e.dataLock.RUnlock()
+		return e.data.Speed
+	})
+	e.registry.MustRegister(e.speed)
+
+	e.calories = prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "calories",
+		Help: "Current calories burned",
+	}, func() float64 {
+		e.dataLock.RLock()
+		defer e.dataLock.RUnlock()
+		return float64(e.data.Calories)
+	})
+	e.registry.MustRegister(e.calories)
 
 	// Start HTTP server for metrics
 	go func() {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", exporter)
+		mux.Handle("/metrics", e)
 
 		slog.Info("Prometheus metrics server listening...", "port", port)
 		if err := http.ListenAndServe(":"+strconv.Itoa(port), mux); err != nil {
@@ -226,23 +257,21 @@ func newPrometheusExporter(port int) *prometheusExporter {
 		}
 	}()
 
-	return exporter
+	return e
 }
 
-func (p *prometheusExporter) Send(rate int) error {
-	p.lastReceivedLock.Lock()
-	p.lastReceived = time.Now()
-	p.lastReceivedLock.Unlock()
-
-	p.rateGauge.Set(float64(rate))
+func (p *prometheusExporter) Update(data healthData, _ string) error {
+	p.dataLock.Lock()
+	p.data = data
+	p.dataLock.Unlock()
 	return nil
 }
 
 // ServeHTTP implements http.Handler to serve metrics only when data is fresh
 func (p *prometheusExporter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.lastReceivedLock.RLock()
-	lastReceived := p.lastReceived
-	p.lastReceivedLock.RUnlock()
+	p.dataLock.RLock()
+	lastReceived := p.data.Time
+	p.dataLock.RUnlock()
 
 	// If no data received yet or data is stale (older than 30 seconds), return empty response
 	if lastReceived.IsZero() || time.Since(lastReceived) > 30*time.Second {
