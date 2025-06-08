@@ -1,81 +1,56 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
-	"github.com/hypebeast/go-osc/osc"
 	"log/slog"
-	"net/http"
-	"strconv"
-	"strings"
+	"os"
 )
 
+// Receiving components
 var (
-	listenPort  = flag.Int("port", 3476, "Websocket port to listen on")
+	receiveMode = flag.String("receive-mode", "hds", "Receive mode: hds, ws-pull")
+	hdsPort     = flag.Int("hds-port", 3476, "HTTP port to listen on HDS data")
+	wsPullURL   = flag.String("ws-pull-url", "ws://localhost:8080/ws", "WebSocket URL to pull data from")
+)
+
+// Exporting components
+var (
+	wsServerEnabled = flag.Bool("ws-server-enabled", false, "Enable WebSocket server")
+	wsServerPort    = flag.Int("ws-server-port", 8080, "WebSocket server port to listen on")
+
+	oscEnabled  = flag.Bool("osc-enabled", true, "Enable OSC sending")
 	oscSendIP   = flag.String("osc-ip", "127.0.0.1", "IP address of OSC to send data to")
 	oscSendPort = flag.Int("osc-port", 9000, "OSC port to send data to")
 	oscAddrName = flag.String("osc-addr", "/avatar/parameters/HeartRate", "Name of OSC address")
+
+	promEnabled = flag.Bool("prom-enabled", false, "Enable Prometheus metrics")
+	promPort    = flag.Int("prom-port", 9090, "Prometheus metrics port to listen on")
 )
-
-type hdsRequest struct {
-	Data string `json:"data"`
-}
-
-const dataPrefix = "heartRate:"
-
-func dataHandler(w http.ResponseWriter, r *http.Request) {
-	var data hdsRequest
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		slog.Error("error decoding request", "err", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	slog.Info("Received req", "data", data.Data)
-	if !strings.HasPrefix(data.Data, dataPrefix) {
-		slog.Error("Invalid data format", "data", data.Data)
-		http.Error(w, "Invalid data format", http.StatusBadRequest)
-		return
-	}
-	rateStr := strings.TrimPrefix(data.Data, dataPrefix)
-	rate, err := strconv.Atoi(rateStr)
-	if err != nil {
-		slog.Error("Error parsing heartRate", "data", data.Data)
-		http.Error(w, "Invalid data format", http.StatusBadRequest)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-
-	if err = sendOSCData(rate); err != nil {
-		slog.Error("Error sending osc data", "err", err)
-	}
-}
-
-const heartRateMax = 256.0
-
-var oscClient *osc.Client
-
-func sendOSCData(rate int) error {
-	msg := osc.NewMessage(*oscAddrName)
-	floatRate := float32(rate) / heartRateMax
-	msg.Append(floatRate)
-	return oscClient.Send(msg)
-}
 
 func main() {
 	flag.Parse()
 
-	slog.Info("OSC config", "addr", *oscAddrName, "ip", *oscSendIP+":"+strconv.Itoa(*oscSendPort))
-	oscClient = osc.NewClient(*oscSendIP, *oscSendPort)
-
-	// See: https://github.com/Rexios80/hds_desktop/blob/master/bin/hds_desktop.dart
-	mux := http.NewServeMux()
-	mux.Handle("PUT /", http.HandlerFunc(dataHandler))
-	http.Handle("/", mux)
-
-	slog.Info("Server listening...", "port", *listenPort)
-	if err := http.ListenAndServe(":"+strconv.Itoa(*listenPort), nil); err != nil {
-		slog.Error(err.Error())
+	var exporters []exporter
+	if *wsServerEnabled {
+		exporters = append(exporters, newHTTPServerExporter(*wsServerPort))
 	}
+	if *oscEnabled {
+		exporters = append(exporters, newOSCExporter(*oscSendIP, *oscSendPort, *oscAddrName))
+	}
+	if *promEnabled {
+		exporters = append(exporters, newPrometheusExporter(*promPort))
+	}
+
+	var r receiver
+	switch *receiveMode {
+	case "hds":
+		r = newHDSReceiver(exporters)
+	case "ws-pull":
+		r = newWSPullReceiver(exporters, *wsPullURL)
+	default:
+		slog.Error("Invalid receive mode", "mode", *receiveMode)
+		os.Exit(1)
+	}
+
+	r.Start()
 }
