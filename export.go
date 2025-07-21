@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bep/debounce"
 	"github.com/gorilla/websocket"
 	"github.com/hypebeast/go-osc/osc"
 	"github.com/prometheus/client_golang/prometheus"
@@ -155,25 +156,56 @@ type oscExporter struct {
 	client       *osc.Client
 	heartRateMax float64
 	addrName     string
+
+	enableAddrName string
+	disableLater   func()
 }
 
-func newOSCExporter(sendIP string, sendPort int, addrName string) *oscExporter {
+func newOSCExporter(sendIP string, sendPort int, addrName, enableAddrName string, enableDebounce time.Duration) *oscExporter {
 	slog.Info("OSC config", "addr", addrName, "ip", sendIP+":"+strconv.Itoa(sendPort))
 	client := osc.NewClient(sendIP, sendPort)
-	return &oscExporter{
-		client:       client,
-		heartRateMax: 256.0,
-		addrName:     addrName,
+
+	o := &oscExporter{
+		client:         client,
+		heartRateMax:   256.0,
+		addrName:       addrName,
+		enableAddrName: enableAddrName,
 	}
+	disable := func() {
+		err := o.sendEnabled(false)
+		if err != nil {
+			slog.Error("Sending OSC message", "err", err)
+		}
+	}
+	debounced := debounce.New(enableDebounce)
+	o.disableLater = func() {
+		debounced(disable)
+	}
+	return o
+}
+
+func (o *oscExporter) sendEnabled(enabled bool) error {
+	msg := osc.NewMessage(o.enableAddrName)
+	msg.Append(enabled)
+	slog.Debug("Sending OSC message", "msg", msg)
+	return o.client.Send(msg)
 }
 
 func (o *oscExporter) Update(data healthData, updatedKey string) error {
 	if updatedKey != "heartRate" && updatedKey != "all" {
 		return nil
 	}
+
+	err := o.sendEnabled(true)
+	if err != nil {
+		return err
+	}
+	o.disableLater()
+
 	msg := osc.NewMessage(o.addrName)
 	floatRate := float64(data.HeartRate) / o.heartRateMax
-	msg.Append(floatRate)
+	msg.Append(float32(floatRate))
+	slog.Debug("Sending OSC message", "msg", msg)
 	return o.client.Send(msg)
 }
 

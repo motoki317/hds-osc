@@ -3,6 +3,7 @@ module github.com/motoki317/hds-osc
 go 1.23.3
 
 require (
+	github.com/bep/debounce v1.2.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/hypebeast/go-osc v0.0.0-20220308234300-cec5a8a1e5f5
 	github.com/prometheus/client_golang v1.22.0
